@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+.venv311/
+venv/
+ENV/
+env/
+
+# 模型文件（太大，不应提交）
+models/
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# 上传的临时文件
+uploads/
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# 日志文件
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 配置文件（包含密钥）
+config.ini
+.env
+secrets.py
+
+# 测试文件
+test_*.py
+compare.log
+performance_test.log
+translation.log
+
+# 临时文件
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# 下载脚本（可选）
+download-*.py
+install-*.ps1
+下载模型.bat

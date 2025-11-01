@@ -1,0 +1,14 @@
+# AI视频翻译服务依赖
+
+# Web框架
+flask>=3.0.0
+werkzeug>=3.0.0
+
+# AI模型
+faster-whisper>=1.0.0
+transformers>=4.35.0
+torch>=2.0.0
+sentencepiece>=0.1.99
+
+# 工具
+requests>=2.31.0
