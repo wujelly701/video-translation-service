@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-批量视频翻译工具 v3.0
-支持：上下文翻译、DeepSeek润色、断点续传、日志记录
+批量视频翻译工具 v3.1
+支持：上下文翻译、并发DeepSeek润色、断点续传、日志记录
 """
 
 import os
@@ -11,8 +11,10 @@ import time
 import json
 import argparse
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import subprocess
 
@@ -59,10 +61,60 @@ def setup_logger():
     return log_file
 
 
-class VideoTranslator:
-    """视频批量翻译器"""
+def cleanup_old_logs(log_dir, keep_days=7, auto_cleanup=False):
+    """
+    清理旧日志文件
 
-    def __init__(self, service_url='http://127.0.0.1:50515', deepseek_key=None, use_polish=False):
+    Args:
+        log_dir: 日志目录路径
+        keep_days: 保留最近几天的日志（默认7天）
+        auto_cleanup: 是否自动清理（默认False，需要配置启用）
+
+    Returns:
+        int: 删除的文件数量
+    """
+    if not auto_cleanup:
+        return 0
+
+    log_dir = Path(log_dir)
+    if not log_dir.exists():
+        return 0
+
+    # 获取当前时间
+    now = time.time()
+    cutoff_time = now - (keep_days * 24 * 3600)
+
+    deleted_count = 0
+    deleted_size = 0
+
+    # 遍历日志目录
+    for log_file in log_dir.glob('translation_*.log'):
+        try:
+            # 获取文件修改时间
+            file_mtime = log_file.stat().st_mtime
+
+            # 如果文件超过保留期限
+            if file_mtime < cutoff_time:
+                file_size = log_file.stat().st_size
+                log_file.unlink()
+                deleted_count += 1
+                deleted_size += file_size
+        except Exception as e:
+            # 删除失败时忽略，继续处理其他文件
+            pass
+
+    if deleted_count > 0:
+        size_mb = deleted_size / (1024 * 1024)
+        print(f"🗑️  已清理 {deleted_count} 个超过 {keep_days} 天的旧日志文件（释放 {size_mb:.1f}MB）")
+
+    return deleted_count
+
+
+class VideoTranslator:
+    """视频批量翻译器（支持并发润色）"""
+
+    def __init__(self, service_url='http://127.0.0.1:50515', deepseek_key=None,
+                 use_polish=False, concurrent_polish=10):
         self.service_url = service_url
 
         # 优先级：命令行参数 > 环境变量 > config.ini
@@ -76,6 +128,12 @@ class VideoTranslator:
             self.deepseek_key = None
 
         self.use_polish = use_polish and self.deepseek_key
+        self.concurrent_polish = concurrent_polish  # 并发数
+
+        # 线程池用于并发润色
+        if self.use_polish:
+            self.polish_executor = ThreadPoolExecutor(max_workers=concurrent_polish)
+            self.polish_lock = threading.Lock()  # 用于日志同步
 
         # 统计信息
         self.stats = {
@@ -95,6 +153,11 @@ class VideoTranslator:
         self.progress_dir.mkdir(exist_ok=True)
         self.progress_file = None
         self.progress_data = {}
+
+    def __del__(self):
+        """清理线程池"""
+        if hasattr(self, 'polish_executor'):
+            self.polish_executor.shutdown(wait=True)
 
     def load_progress(self, task_name):
         """加载进度文件"""
@@ -144,7 +207,6 @@ class VideoTranslator:
         status = self.progress_data[video_name].get('status')
 
         if status == 'completed':
-            # 已标记完成但文件不存在，重新处理
             return False, '上次完成但文件缺失，重新处理'
         elif status == 'processing':
             return False, '上次未完成，重新处理'
@@ -209,7 +271,7 @@ class VideoTranslator:
                 response = requests.post(
                     f"{self.service_url}/transcribe",
                     files=files,
-                    timeout=3600  # 1小时，支持3小时视频
+                    timeout=3600
                 )
 
             if response.status_code == 200:
@@ -235,7 +297,7 @@ class VideoTranslator:
                         'source_language': source_lang,
                         'target_language': target_lang
                     },
-                    timeout=90  # 1.5分钟
+                    timeout=90
                 )
 
                 if response.status_code == 200:
@@ -248,14 +310,12 @@ class VideoTranslator:
                     return text
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
-                    logging.warning(f"  ! 翻译超时，重试 {attempt + 1}/{max_retries}")
                     time.sleep(2)
                 else:
-                    logging.warning(f"  ! 翻译超时: {text[:30]}...")
+                    logging.warning(f"  ! 翻译超时")
                     return text
             except Exception as e:
                 if attempt < max_retries - 1:
-                    logging.warning(f"  ! 翻译错误，重试 {attempt + 1}/{max_retries}: {e}")
                     time.sleep(2)
                 else:
                     logging.warning(f"  ! 翻译失败: {e}")
@@ -309,7 +369,8 @@ class VideoTranslator:
 3. 使用最自然地道的{target_name}口语表达
 4. 避免书面语和直译腔
 5. 保持与上下文的连贯性
-6. 只返回润色后的翻译，不要任何解释
+6. **重要：只返回这一句话的润色翻译，不要分成多行，不要添加其他句子**
+7. 不要任何解释、标点符号或多余内容
 
 润色后："""
 
@@ -330,13 +391,28 @@ class VideoTranslator:
                         'temperature': 0.5,
                         'max_tokens': 500
                     },
-                    timeout=90  # 1.5分钟
+                    timeout=90
                 )
 
                 if response.status_code == 200:
                     result = response.json()
                     polished = result['choices'][0]['message']['content'].strip()
-                    return polished.strip('"\'')
+
+                    # 如果返回多行，只取第一行（修复DeepSeek可能返回多行的问题）
+                    if '\n' in polished:
+                        polished = polished.split('\n')[0].strip()
+
+                    # 清理可能的多余字符（如开头的"- "等）
+                    polished = polished.lstrip('- •·').strip()
+
+                    # 清理引号
+                    polished = polished.strip('"\'').strip()
+
+                    # 最终验证：如果结果为空或太短，使用原译文
+                    if not polished or len(polished) < 2:
+                        return translated
+
+                    return polished
                 else:
                     if attempt < max_retries - 1:
                         time.sleep(2)
@@ -344,19 +420,84 @@ class VideoTranslator:
                     return translated
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
-                    logging.warning(f"  ! 润色超时，重试 {attempt + 1}/{max_retries}")
                     time.sleep(2)
                 else:
-                    logging.warning(f"  ! 润色超时，使用原译文")
                     return translated
             except Exception as e:
                 if attempt < max_retries - 1:
-                    logging.warning(f"  ! 润色错误，重试 {attempt + 1}/{max_retries}: {e}")
                     time.sleep(2)
                 else:
-                    logging.warning(f"  ! 润色失败，使用原译文: {e}")
                     return translated
         return translated
+
+    def polish_batch_with_context(self, segments, source_lang, target_lang):
+        """批量并发润色（带上下文）"""
+        if not self.use_polish:
+            return
+
+        logging.info(f"  [4/5] DeepSeek并发润色（{self.concurrent_polish}线程）...")
+
+        # 提交所有任务
+        futures = {}
+        for i, seg in enumerate(segments):
+            context_before, context_after = self.get_context_window(segments, i, window_size=2)
+
+            future = self.polish_executor.submit(
+                self.polish_translation_with_context,
+                seg['text'],
+                seg['translated'],
+                context_before,
+                context_after,
+                source_lang,
+                target_lang
+            )
+            futures[future] = i
+
+        # 收集结果
+        completed = 0
+        polish_examples = []  # 记录润色示例
+        total = len(segments)
+
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                polished = future.result(timeout=120)  # 2分钟超时
+
+                # 记录变化（前3个示例）
+                if polished != segments[i]['translated'] and len(polish_examples) < 3:
+                    context_before, context_after = self.get_context_window(segments, i, 2)
+                    polish_examples.append({
+                        'index': i + 1,
+                        'original': segments[i]['translated'],
+                        'polished': polished,
+                        'context_before': context_before,
+                        'context_after': context_after
+                    })
+
+                segments[i]['translated'] = polished
+
+            except Exception as e:
+                # 失败时保持原译文
+                pass
+
+            completed += 1
+            # 每完成20%显示一次进度
+            if completed % max(1, total // 5) == 0 or completed == total:
+                logging.info(f"    润色进度: {completed}/{total} ({completed * 100 // total}%)")
+
+        logging.info(f"  [4/5] 并发润色完成 ✓")
+
+        # 显示润色示例
+        if polish_examples:
+            logging.info("")
+            for example in polish_examples:
+                if example['context_before']:
+                    logging.info(f"    上文: ...{example['context_before'][-1]}")
+                logging.info(f"    [{example['index']}] 原译: {example['original']}")
+                logging.info(f"    [{example['index']}] 润色: {example['polished']}")
+                if example['context_after']:
+                    logging.info(f"    下文: {example['context_after'][0]}...")
+                logging.info("")
 
     def format_time(self, seconds):
         """格式化时间为SRT格式"""
@@ -392,7 +533,7 @@ class VideoTranslator:
 
     def translate_video(self, video_path, target_lang='zh', source_lang='auto',
                         translation_only=False, output_dir=None):
-        """翻译单个视频（带进度管理和上下文翻译）"""
+        """翻译单个视频（带进度管理和并发润色）"""
         video_path = Path(video_path)
         video_name = video_path.name
 
@@ -425,15 +566,15 @@ class VideoTranslator:
             start_time = time.time()
 
             # 1. 提取音频
-            logging.info("  [1/4] 提取音频...""")
+            logging.info("  [1/4] 提取音频...")
             audio_path = output_dir / f"{video_path.stem}_temp.wav"
 
             if not self.extract_audio(str(video_path), str(audio_path)):
                 raise Exception("音频提取失败")
-            logging.info(" ✓")
+            logging.info("  [1/4] 提取音频完成 ✓")
 
             # 2. 语音识别
-            logging.info("  [2/4] 语音识别（长视频可能需要数分钟）...""")
+            logging.info("  [2/4] 语音识别（长视频可能需要数分钟）...")
             transcribe_start = time.time()
             result = self.transcribe(str(audio_path))
 
@@ -449,13 +590,12 @@ class VideoTranslator:
             segments = result.get('segments', [])
             detected_lang = result.get('language', source_lang)
             transcribe_time = time.time() - transcribe_start
-            logging.info(f" ✓ ({len(segments)}段, {transcribe_time:.1f}秒)")
+            logging.info(f"  [2/4] 语音识别完成 ✓ ({len(segments)}段, {transcribe_time:.1f}秒)")
 
-            # 3. 翻译（分两步：先翻译，再润色）
+            # 3. 翻译（批量翻译）
             translate_start = time.time()
-
-            # 步骤1：批量翻译
             logging.info(f"  [3/4] 翻译 {len(segments)} 段...")
+
             for i, seg in enumerate(segments, 1):
                 translated = self.translate_text(
                     seg['text'],
@@ -464,56 +604,29 @@ class VideoTranslator:
                 )
                 seg['translated'] = translated
 
-                if i % 10 == 0 or i == len(segments):
-                    logging.info(f"    翻译进度: {i}/{len(segments)}")
+                # 每完成20%显示一次进度
+                if i % max(1, len(segments) // 5) == 0 or i == len(segments):
+                    logging.info(f"    翻译进度: {i}/{len(segments)} ({i * 100 // len(segments)}%)")
 
-            logging.info(f"    翻译进度: {len(segments)}/{len(segments)} ✓")
+            logging.info(f"  [3/4] 翻译完成 ✓")
 
-            # 步骤2：带上下文润色
+            # 4. 并发润色
             if self.use_polish:
-                logging.info(f"  [4/5] DeepSeek润色（结合上下文）...")
-                polish_count = 0
-
-                for i, seg in enumerate(segments):
-                    # 获取上下文
-                    context_before, context_after = self.get_context_window(segments, i, window_size=2)
-
-                    # 润色
-                    polished = self.polish_translation_with_context(
-                        seg['text'],
-                        seg['translated'],
-                        context_before,
-                        context_after,
-                        detected_lang if source_lang == 'auto' else source_lang,
-                        target_lang
-                    )
-
-                    # 记录变化（前3个示例）
-                    if polished != seg['translated'] and polish_count < 3:
-                        if context_before:
-                            logging.info(f"    上文: ...{context_before[-1]}")
-                        logging.info(f"    [{i + 1}] 原译: {seg['translated']}")
-                        logging.info(f"    [{i + 1}] 润色: {polished}")
-                        if context_after:
-                            logging.info(f"    下文: {context_after[0]}...")
-                        polish_count += 1
-
-                    seg['translated'] = polished
-
-                    if (i + 1) % 10 == 0 or (i + 1) == len(segments):
-                        logging.info(f"    润色进度: {i + 1}/{len(segments)}")
-
-                logging.info(f"    润色进度: {len(segments)}/{len(segments)} ✓")
+                self.polish_batch_with_context(
+                    segments,
+                    detected_lang if source_lang == 'auto' else source_lang,
+                    target_lang
+                )
 
             translate_time = time.time() - translate_start
-            polish_suffix = " (含DeepSeek上下文润色)" if self.use_polish else ""
+            polish_suffix = f" (含{self.concurrent_polish}线程并发润色)" if self.use_polish else ""
 
-            # 4. 生成字幕
+            # 5. 生成字幕
             step_num = 5 if self.use_polish else 4
-            logging.info(f"  [{step_num}/{step_num}] 生成字幕...""")
+            logging.info(f"  [{step_num}/{step_num}] 生成字幕...")
             if not self.generate_srt(segments, str(srt_path), translation_only):
                 raise Exception("生成字幕失败")
-            logging.info(" ✓")
+            logging.info(f"  [{step_num}/{step_num}] 生成字幕完成 ✓")
 
             total_time = time.time() - start_time
 
@@ -589,7 +702,10 @@ class VideoTranslator:
         logging.info(f"视频数量: {len(video_files)}")
         logging.info(f"目标语言: {target_lang}")
         logging.info(f"字幕模式: {'仅译文' if translation_only else '双语字幕'}")
-        logging.info(f"DeepSeek润色: {'启用（上下文润色）' if self.use_polish else '禁用'}")
+        if self.use_polish:
+            logging.info(f"DeepSeek润色: 启用（{self.concurrent_polish}线程并发）")
+        else:
+            logging.info(f"DeepSeek润色: 禁用")
         logging.info(f"{'=' * 70}")
 
         # 处理每个视频
@@ -659,7 +775,7 @@ class VideoTranslator:
 
         if failed:
             logging.info("\n失败列表:")
-            for video in failed[:10]:  # 只显示前10个
+            for video in failed[:10]:
                 error = self.progress_data[video].get('error', '未知错误')
                 retry = self.progress_data[video].get('retry_count', 0)
                 logging.info(f"  - {video}: {error} (重试{retry}次)")
@@ -678,21 +794,21 @@ class VideoTranslator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='批量视频翻译工具 v3.0 - 上下文翻译、DeepSeek润色、断点续传',
+        description='批量视频翻译工具 v3.1 - 并发润色、上下文翻译、断点续传',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 翻译单个视频
+  # 翻译单个视频（10线程并发润色）
   python batch_translate.py video.mp4 -t zh
 
   # 批量翻译（自动断点续传）
   python batch_translate.py videos/ -t zh
 
+  # 自定义并发数（20线程）
+  python batch_translate.py videos/ -t zh --concurrent 20
+
   # 查看进度
   python batch_translate.py videos/ --show-progress
-
-  # 清除进度重新开始
-  python batch_translate.py videos/ -t zh --reset-progress
         """
     )
 
@@ -703,6 +819,7 @@ def main():
     parser.add_argument('--translation-only', action='store_true', help='仅生成译文字幕（不含原文）')
     parser.add_argument('--recursive', '-r', action='store_true', help='递归处理子目录')
     parser.add_argument('--polish', action='store_true', help='使用DeepSeek润色翻译')
+    parser.add_argument('--concurrent', type=int, default=10, help='DeepSeek并发数（默认: 10）')
     parser.add_argument('--deepseek-key', help='DeepSeek API密钥')
     parser.add_argument('--service-url', default='http://127.0.0.1:50515',
                         help='翻译服务地址（默认: http://127.0.0.1:50515）')
@@ -736,7 +853,8 @@ def main():
     translator = VideoTranslator(
         service_url=args.service_url,
         deepseek_key=args.deepseek_key,
-        use_polish=use_polish
+        use_polish=use_polish,
+        concurrent_polish=args.concurrent
     )
 
     # 处理进度命令
@@ -755,6 +873,17 @@ def main():
     logging.info(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logging.info("")
 
+    # 自动清理旧日志（如果配置启用）
+    if CONFIG_AVAILABLE:
+        auto_cleanup = getattr(config, 'auto_cleanup_logs', False)
+        keep_days = getattr(config, 'log_keep_days', 7)
+    else:
+        auto_cleanup = os.getenv('AUTO_CLEANUP_LOGS', '').lower() in ('true', '1', 'yes')
+        keep_days = int(os.getenv('LOG_KEEP_DAYS', '7'))
+
+    if auto_cleanup:
+        cleanup_old_logs('log', keep_days, auto_cleanup)
+
     # 检查服务
     if not translator.check_service():
         return 1
@@ -764,7 +893,7 @@ def main():
         if translator.deepseek_key:
             logging.info(f"✓ DeepSeek API密钥已配置")
             if translator.use_polish:
-                logging.info(f"✓ DeepSeek上下文润色已启用")
+                logging.info(f"✓ DeepSeek并发润色已启用（{args.concurrent}线程）")
         else:
             logging.error("× DeepSeek API密钥未配置")
 
